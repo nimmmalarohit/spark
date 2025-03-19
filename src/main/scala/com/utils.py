@@ -1,39 +1,38 @@
-async def search_wiki_knowledge(query: str) -> Tuple[str, Optional[str]]:
-    """Search the wiki knowledge base for relevant content."""
-    try:
-        knowledge_base = WikiKnowledgeBase()
-        # Try to load or initialize the knowledge base
-        if not knowledge_base.load(KNOWLEDGE_BASE_PATH):
-            success = initialize_knowledge_base()
-            if not success:
-                return None, "Knowledge base could not be initialized"
-            
-            # Try loading again after initialization
-            if not knowledge_base.load(KNOWLEDGE_BASE_PATH):
-                return None, "Knowledge base initialization failed"
-            
-        results = knowledge_base.search(query, k=3)  # Get top 3 results
-        if not results:
-            return None, "No results found"
-        
-        # Check if any result has good similarity
-        best_result = results[0]
-        content, metadata, score = best_result
-        
-        # Only return if confidence is high enough
-        if score < 0.15:  # Lower threshold to catch more variations
-            return None, "Low confidence results"
-        
-        # Format response in a cleaner way
-        # Extract the actual content without the heading
-        content_parts = content.split("\n\n", 1)
-        actual_content = content_parts[1] if len(content_parts) > 1 else content
-        
-        # Clean up the content - remove any markdown formatting
-        actual_content = actual_content.replace('#', '').strip()
-        
-        # Just return the content directly, without extra formatting
-        return actual_content, None
-    except Exception as e:
-        logger.error(f"Error searching wiki: {str(e)}")
-        return None, f"Error: {str(e)}"
+def search(self, query: str, k: int = 3) -> List[Tuple[str, Dict[str, Any], float]]:
+    """Search for similar documents in the knowledge base with better question handling."""
+    if not self.initialized or self.vectors is None:
+        logger.warning("Knowledge base not initialized yet.")
+        return []
+    
+    # Preprocess query to handle variations
+    # Remove common question words and normalize
+    query = query.lower()
+    question_starters = ["what is", "what are", "how to", "where is", "who is", "tell me about", "show me"]
+    for starter in question_starters:
+        if query.startswith(starter):
+            query = query[len(starter):].strip()
+    
+    # Add common topic keywords to improve matching
+    if "version" in query and "python" not in query and "spark" not in query:
+        # If asking about versions generally, expand query
+        expanded_query = f"{query} python spark version"
+        query_vector = self.vectorizer.transform([expanded_query])
+    else:
+        query_vector = self.vectorizer.transform([query])
+    
+    # Calculate similarity with all documents
+    similarities = cosine_similarity(query_vector, self.vectors).flatten()
+    
+    # Get top k results
+    top_indices = similarities.argsort()[-k:][::-1]
+    
+    # Return results with scores
+    results = []
+    for idx in top_indices:
+        if idx < len(self.documents):
+            score = similarities[idx]
+            # Only include results with some similarity
+            if score > 0.1:  # Lower threshold
+                results.append((self.documents[idx], self.metadata[idx], float(score)))
+    
+    return results
