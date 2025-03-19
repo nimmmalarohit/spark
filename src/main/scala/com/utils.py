@@ -2,18 +2,17 @@ import logging
 import json
 import os
 import numpy as np
-import shutil
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-import pdfplumber
+import pdfplumber  # Keep using pdfplumber as requested
 
 from rasa_sdk import Tracker
 from rasa_sdk.executor import CollectingDispatcher
 from rasa_sdk.types import DomainDict
-from rasa_sdk.events import EventType, ConversationPaused, UserUtteranceReverted, SlotSet
+from rasa_sdk.events import EventType, ConversationPaused, UserUtteranceReverted
 from optimus.sdk.action_meta import OptimusAction
 from optimus.message_components.postback_button.button import PostBackButton, utter_buttons
 
@@ -201,7 +200,7 @@ class PDFContentExtractor:
             return False
             
     def _process_text(self, text: str, page_num: int) -> List[Tuple[str, Dict[str, Any]]]:
-        """Process text into logical chunks by sections."""
+        """Process text into logical chunks by sections, preserving complete content."""
         if not text:
             return []
             
@@ -225,11 +224,11 @@ class PDFContentExtractor:
                     is_heading = True
                 # Short lines that may be headings (but not too short)
                 elif 3 <= len(stripped_line) <= 80:
-                    # Check if it's followed by a blank line or if it has title case
+                    # Check if it's followed by a blank line
                     if line_position < len(lines) - 1 and not lines[line_position].strip():
                         is_heading = True
-                    # Title case often indicates headings
-                    elif stripped_line.istitle():
+                    # Check for title case or all caps which often indicate headings
+                    elif stripped_line.istitle() or stripped_line.isupper():
                         is_heading = True
             
             # If heading found and we already have content, save the current chunk
@@ -248,7 +247,7 @@ class PDFContentExtractor:
             elif stripped_line:
                 current_text.append(stripped_line)
         
-        # Add the last chunk if exists
+        # Add the last chunk if exists - ensure we capture the full content
         if current_heading and current_text:
             chunk_text = current_heading + '\n\n' + '\n'.join(current_text)
             chunk_metadata = {
@@ -259,37 +258,33 @@ class PDFContentExtractor:
         
         # If no chunks were created, create one from the entire text
         if not chunks and text.strip():
-            # Try to detect logical sections
-            paragraphs = text.split('\n\n')
-            if len(paragraphs) > 1:
-                # Create multiple chunks from paragraphs
-                for i, para in enumerate(paragraphs):
-                    if len(para.strip()) > 20:  # Only include substantial paragraphs
-                        chunk_metadata = {
-                            "page": page_num,
-                            "heading": f"Section {i+1}",
-                        }
-                        chunks.append((para.strip(), chunk_metadata))
-            else:
-                # One chunk for the whole page
-                chunk_metadata = {
-                    "page": page_num,
-                    "heading": "Page content",
-                }
-                chunks.append((text.strip(), chunk_metadata))
+            # Full page as one chunk
+            chunk_metadata = {
+                "page": page_num,
+                "heading": "Page content",
+            }
+            chunks.append((text.strip(), chunk_metadata))
         
         return chunks
+
+
+# Function to check if knowledge base is up to date
+def is_knowledge_base_current() -> bool:
+    """Check if knowledge base is up to date with the PDF."""
+    kb = WikiKnowledgeBase()
+    if not kb.load(KNOWLEDGE_BASE_PATH):
+        return False
+        
+    return not kb.needs_update()
 
 
 # Initialize or refresh the knowledge base
 def initialize_knowledge_base(force_refresh=False) -> bool:
     """Initialize the knowledge base from the repository PDF."""
     # Check if knowledge base exists and is up to date
-    if not force_refresh:
-        kb = WikiKnowledgeBase()
-        if kb.load(KNOWLEDGE_BASE_PATH):
-            logger.info("Knowledge base is up to date.")
-            return True
+    if not force_refresh and is_knowledge_base_current():
+        logger.info("Knowledge base is up to date.")
+        return True
     
     # Knowledge base doesn't exist or needs refresh
     logger.info("Creating or refreshing knowledge base from PDF...")
@@ -302,7 +297,6 @@ def initialize_knowledge_base(force_refresh=False) -> bool:
     if os.path.exists(f"{KNOWLEDGE_BASE_PATH}.json"):
         try:
             os.remove(f"{KNOWLEDGE_BASE_PATH}.json")
-            logger.info("Deleted existing knowledge base file")
         except Exception as e:
             logger.warning(f"Could not remove old knowledge base file: {e}")
     
@@ -314,6 +308,11 @@ def initialize_knowledge_base(force_refresh=False) -> bool:
 async def search_wiki_knowledge(tracker: Tracker) -> Tuple[str, Optional[str]]:
     """Search the wiki knowledge base using Rasa NLU information."""
     try:
+        # Check if knowledge base needs updating
+        if not is_knowledge_base_current():
+            logger.info("PDF has been modified. Refreshing knowledge base...")
+            initialize_knowledge_base(force_refresh=True)
+        
         # Get Rasa's intent and entities information
         latest_message = tracker.latest_message
         intent = latest_message.get("intent", {}).get("name")
@@ -342,67 +341,26 @@ async def search_wiki_knowledge(tracker: Tracker) -> Tuple[str, Optional[str]]:
         # Search with enhanced query
         results = knowledge_base.search(enhanced_query, k=3)
         if not results:
-            return None, "No results found"
+            # Try again with original query if enhanced query returned no results
+            results = knowledge_base.search(query, k=3)
+            if not results:
+                return None, "No results found"
         
         # Get best result
         content, metadata, score = results[0]
         
-        # Process content to extract complete information
-        # Important: Don't truncate the content!
-        if '\n\n' in content:
-            heading, full_content = content.split('\n\n', 1)
-        else:
-            heading = metadata.get('heading', '')
-            full_content = content
+        # IMPORTANT: Make sure we return the complete text, including any ending part
+        # We previously split by heading, let's keep the full content
+        full_content = content
         
-        # Remove any formatting characters that might cause truncation
-        clean_content = full_content.replace('#', '').strip()
+        # Clean up the full content without removing any parts
+        full_content = full_content.replace('#', '').strip()
         
         # Return the complete content
-        return clean_content, None
+        return full_content, None
     except Exception as e:
         logger.error(f"Error searching wiki: {str(e)}")
         return None, f"Error: {str(e)}"
-
-
-class ActionRefreshKnowledgeBase(OptimusAction, action_name="action_refresh_knowledge_base"):
-    """Action to manually refresh the knowledge base."""
-
-    async def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: DomainDict) -> List[EventType]:
-        logger.info("Manual knowledge base refresh requested")
-        
-        try:
-            # Force complete refresh by removing the file
-            if os.path.exists(f"{KNOWLEDGE_BASE_PATH}.json"):
-                try:
-                    # Create a backup just in case
-                    backup_path = f"{KNOWLEDGE_BASE_PATH}_backup.json"
-                    shutil.copy(f"{KNOWLEDGE_BASE_PATH}.json", backup_path)
-                    
-                    # Delete the file
-                    os.remove(f"{KNOWLEDGE_BASE_PATH}.json")
-                    logger.info("Deleted existing knowledge base file")
-                except Exception as e:
-                    logger.warning(f"Error handling knowledge base file: {e}")
-            
-            # Recreate the knowledge base
-            success = initialize_knowledge_base(force_refresh=True)
-            
-            # IMPORTANT: Respond with a message that won't match any content in your PDF
-            if success:
-                msg = "✅ KNOWLEDGE BASE REFRESHED: The system has updated its information from the latest PDF data."
-                dispatcher.utter_message(text=msg)
-            else:
-                msg = "❌ REFRESH FAILED: Could not update the knowledge base. Please check server logs."
-                dispatcher.utter_message(text=msg)
-            
-            # Return a SlotSet event to prevent fallback processing
-            return [SlotSet("kb_refreshed", True)]
-            
-        except Exception as e:
-            logger.error(f"Error refreshing knowledge base: {e}")
-            dispatcher.utter_message(text=f"❌ ERROR: {str(e)}")
-            return [SlotSet("kb_refreshed", False)]
 
 
 class ActionDefaultFallback(OptimusAction, action_name="action_gcp_default_fallback"):
@@ -412,12 +370,6 @@ class ActionDefaultFallback(OptimusAction, action_name="action_gcp_default_fallb
         latest_message = tracker.latest_message.get('text')
         logger.info(f'### User query "{latest_message}" falling back ###')
         
-        # First check if it's a refresh command that was missed by the NLU
-        if "update" in latest_message.lower() and "knowledge" in latest_message.lower():
-            logger.info("Detected knowledge base refresh request in fallback")
-            action = ActionRefreshKnowledgeBase()
-            return await action.run(dispatcher, tracker, domain)
-            
         # Try to find relevant information in knowledge base using Rasa NLU
         wiki_response, error = await search_wiki_knowledge(tracker)
         
@@ -434,32 +386,3 @@ class ActionDefaultFallback(OptimusAction, action_name="action_gcp_default_fallb
             buttons=[draft_email_button]
         )
         return [ConversationPaused(), UserUtteranceReverted()]
-
-
-# Debugging action to see what intent is being recognized
-class ActionDebugNLU(OptimusAction, action_name="action_debug_nlu"):
-    """Debug action to show NLU processing information."""
-    
-    async def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: DomainDict) -> List[EventType]:
-        latest_message = tracker.latest_message
-        
-        # Get NLU info
-        intent = latest_message.get("intent", {})
-        entities = latest_message.get("entities", [])
-        
-        # Format debug message
-        debug_msg = f"📊 NLU DEBUG INFO:\n\n"
-        debug_msg += f"Intent: {intent.get('name')} (confidence: {intent.get('confidence', 0):.2f})\n\n"
-        
-        if entities:
-            debug_msg += "Entities:\n"
-            for entity in entities:
-                debug_msg += f"- {entity.get('entity')}: {entity.get('value')} ({entity.get('confidence', 0):.2f})\n"
-        else:
-            debug_msg += "No entities detected.\n"
-            
-        # Send debug info
-        dispatcher.utter_message(text=debug_msg)
-        
-        # Return a SlotSet to prevent fallback
-        return [SlotSet("debug_complete", True)]
