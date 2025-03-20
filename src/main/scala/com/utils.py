@@ -2,7 +2,9 @@ import logging
 import json
 import os
 import re
-from typing import List, Dict, Any, Tuple, Optional
+import difflib
+from typing import List, Dict, Any, Tuple, Optional, Set
+from collections import Counter
 
 import pdfplumber
 
@@ -15,74 +17,210 @@ from optimus.message_components.postback_button.button import PostBackButton, ut
 
 logger = logging.getLogger(__name__)
 
-# Define paths - use absolute paths to avoid any confusion
+# Define paths
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-DEFAULT_PDF_PATH = os.path.join(DATA_DIR, "gcp_t2_l3.pdf")  # Updated to match your actual PDF name
+DEFAULT_PDF_PATH = os.path.join(DATA_DIR, "gcp_t2_l3.pdf")
 KNOWLEDGE_BASE_PATH = os.path.join(DATA_DIR, "wiki_knowledge.json")
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
 
-class PDFKnowledgeBase:
-    """Robust knowledge base for PDF content."""
+class UniversalKnowledgeBase:
+    """Generic knowledge base with advanced fuzzy matching for any content domain."""
     
     def __init__(self):
-        self.sections = {}  # {id: {title, content}}
+        self.sections = {}  # {id: {title, content, text_signature}}
+        self.word_index = {}  # {normalized_word: {section_ids}}
+        self.phrase_index = {}  # {phrase: {section_ids}}
         self.initialized = False
         
     def add_section(self, section_id: str, title: str, content: str):
-        """Add a section to the knowledge base."""
+        """Add a section with advanced indexing."""
+        # Store the section
+        full_text = f"{title} {content}"
         self.sections[section_id] = {
             "title": title,
-            "content": content
+            "content": content,
+            "text_signature": self._create_text_signature(full_text)
         }
         
-    def search(self, query: str) -> List[Tuple[str, str, float]]:
-        """Search for content matching the query."""
-        if not self.initialized or not self.sections:
-            logger.warning("Knowledge base not initialized or empty")
+        # Index individual words
+        words = self._extract_words(full_text)
+        for word in words:
+            normalized = self._normalize_word(word)
+            if len(normalized) >= 3:  # Only index meaningful words
+                if normalized not in self.word_index:
+                    self.word_index[normalized] = set()
+                self.word_index[normalized].add(section_id)
+        
+        # Index phrases (2-3 word combinations)
+        word_list = [w for w in words if len(self._normalize_word(w)) >= 3]
+        for i in range(len(word_list) - 1):
+            # 2-word phrases
+            phrase = f"{word_list[i]} {word_list[i+1]}".lower()
+            if phrase not in self.phrase_index:
+                self.phrase_index[phrase] = set()
+            self.phrase_index[phrase].add(section_id)
+            
+            # 3-word phrases
+            if i < len(word_list) - 2:
+                phrase = f"{word_list[i]} {word_list[i+1]} {word_list[i+2]}".lower()
+                if phrase not in self.phrase_index:
+                    self.phrase_index[phrase] = set()
+                self.phrase_index[phrase].add(section_id)
+    
+    def search(self, query: str) -> List[Tuple[str, float]]:
+        """Search using multi-stage matching with fuzzy word matching."""
+        if not self.initialized:
             return []
         
-        # Clean query
-        query = query.lower().strip()
+        # Extract query words and create signature
+        query_words = self._extract_words(query)
+        query_signature = self._create_text_signature(query)
         
-        # Extract keywords (anything 3+ chars)
-        keywords = [w.lower() for w in re.findall(r'\b\w{3,}\b', query)]
+        # Stage 1: Find potential section matches based on indexed words and phrases
+        candidates = set()
         
-        # Calculate match scores for each section
-        results = []
-        for section_id, section in self.sections.items():
-            title = section["title"].lower()
-            content = section["content"].lower()
+        # Check for exact phrase matches (highest priority)
+        for i in range(len(query_words) - 1):
+            if i < len(query_words) - 1:
+                phrase = f"{query_words[i]} {query_words[i+1]}".lower()
+                if phrase in self.phrase_index:
+                    candidates.update(self.phrase_index[phrase])
             
-            # Calculate score based on keyword matches
-            score = 0
-            for keyword in keywords:
-                # Higher score for title matches
-                if keyword in title:
-                    score += 3
-                # Score for content matches
-                if keyword in content:
-                    score += 1
-            
-            # Normalize by number of keywords
-            if keywords:
-                score = score / len(keywords)
+            if i < len(query_words) - 2:
+                phrase = f"{query_words[i]} {query_words[i+1]} {query_words[i+2]}".lower()
+                if phrase in self.phrase_index:
+                    candidates.update(self.phrase_index[phrase])
+        
+        # Add word matches (including fuzzy matching for each word)
+        for word in query_words:
+            normalized = self._normalize_word(word)
+            if len(normalized) >= 3:
+                # Exact word match
+                if normalized in self.word_index:
+                    candidates.update(self.word_index[normalized])
                 
-                # Only include if score is reasonable
-                if score > 0.5:
-                    full_content = f"{section['title']}\n\n{section['content']}"
-                    results.append((section_id, full_content, score))
+                # Fuzzy word matching
+                if len(normalized) >= 4:  # Only do fuzzy matching for longer words
+                    close_matches = self._find_fuzzy_word_matches(normalized)
+                    for match in close_matches:
+                        if match in self.word_index:
+                            candidates.update(self.word_index[match])
         
-        # Sort by score
-        results.sort(key=lambda x: x[2], reverse=True)
+        if not candidates:
+            # Fallback: include all sections if no matches found
+            candidates = set(self.sections.keys())
+        
+        # Stage 2: Score candidates based on text similarity
+        results = []
+        for section_id in candidates:
+            section = self.sections[section_id]
+            
+            # Calculate similarity score based on multiple factors
+            title_similarity = self._calculate_similarity(query, section["title"]) * 2.0  # Title matches weighted more
+            content_similarity = self._calculate_similarity(query, section["content"])
+            signature_similarity = self._compare_signatures(query_signature, section["text_signature"])
+            
+            # Combined score
+            score = (title_similarity + content_similarity + signature_similarity) / 3
+            
+            # Add to results if score is reasonable
+            if score > 0.1:
+                results.append((section_id, score))
+        
+        # Sort by score and return best matches
+        results.sort(key=lambda x: x[1], reverse=True)
         return results
+    
+    def get_content(self, section_id: str) -> str:
+        """Get the content of a section."""
+        if section_id not in self.sections:
+            return ""
+        return self.sections[section_id]["content"]
+    
+    def _extract_words(self, text: str) -> List[str]:
+        """Extract meaningful words from text."""
+        return re.findall(r'\b[a-zA-Z0-9]+\b', text.lower())
+    
+    def _normalize_word(self, word: str) -> str:
+        """Normalize a word for indexing and matching."""
+        return word.lower().strip()
+    
+    def _create_text_signature(self, text: str) -> Dict[str, int]:
+        """Create a frequency-based signature of the text."""
+        words = self._extract_words(text)
+        signature = Counter([self._normalize_word(w) for w in words if len(self._normalize_word(w)) >= 3])
+        return dict(signature)
+    
+    def _compare_signatures(self, sig1: Dict[str, int], sig2: Dict[str, int]) -> float:
+        """Compare two text signatures for similarity."""
+        if not sig1 or not sig2:
+            return 0.0
+            
+        # Calculate overlap coefficient of shared words
+        common_words = set(sig1.keys()) & set(sig2.keys())
+        if not common_words:
+            return 0.0
+            
+        total1 = sum(sig1.values())
+        total2 = sum(sig2.values())
+        if total1 == 0 or total2 == 0:
+            return 0.0
+            
+        # Calculate weighted similarity based on word frequencies
+        similarity = 0.0
+        for word in common_words:
+            similarity += min(sig1.get(word, 0), sig2.get(word, 0))
+            
+        # Normalize
+        return similarity / max(total1, total2)
+    
+    def _calculate_similarity(self, query: str, text: str) -> float:
+        """Calculate simple similarity between query and text."""
+        query = query.lower()
+        text = text.lower()
+        
+        # Simple similarity using difflib
+        return difflib.SequenceMatcher(None, query, text).ratio()
+    
+    def _find_fuzzy_word_matches(self, word: str) -> List[str]:
+        """Find fuzzy matches for a word in the index."""
+        candidates = []
+        
+        # Check for words with the same beginning
+        for indexed_word in self.word_index.keys():
+            # Words starting with the same characters
+            if indexed_word.startswith(word[:min(3, len(word))]):
+                candidates.append(indexed_word)
+                
+            # Words with high similarity
+            if difflib.SequenceMatcher(None, word, indexed_word).ratio() > 0.8:
+                candidates.append(indexed_word)
+                
+            # Edit distance for typos (basic implementation)
+            if len(word) > 4 and abs(len(word) - len(indexed_word)) <= 2:
+                if sum(1 for a, b in zip(word, indexed_word) if a != b) <= 2:
+                    candidates.append(indexed_word)
+        
+        return candidates
     
     def save(self, file_path: str) -> bool:
         """Save knowledge base to file."""
         try:
+            # Convert set objects to lists for JSON serialization
+            serializable_word_index = {k: list(v) for k, v in self.word_index.items()}
+            serializable_phrase_index = {k: list(v) for k, v in self.phrase_index.items()}
+            
+            data = {
+                "sections": self.sections,
+                "word_index": serializable_word_index,
+                "phrase_index": serializable_phrase_index
+            }
+            
             with open(file_path, 'w') as f:
-                json.dump(self.sections, f, indent=2)
+                json.dump(data, f)
+                
             self.initialized = True
             logger.info(f"Saved knowledge base with {len(self.sections)} sections")
             return True
@@ -98,7 +236,13 @@ class PDFKnowledgeBase:
                 return False
             
             with open(file_path, 'r') as f:
-                self.sections = json.load(f)
+                data = json.load(f)
+                
+            self.sections = data["sections"]
+            
+            # Convert lists back to sets
+            self.word_index = {k: set(v) for k, v in data["word_index"].items()}
+            self.phrase_index = {k: set(v) for k, v in data["phrase_index"].items()}
             
             self.initialized = len(self.sections) > 0
             logger.info(f"Loaded knowledge base with {len(self.sections)} sections")
@@ -108,9 +252,9 @@ class PDFKnowledgeBase:
             return False
 
 
-def extract_pdf_content(pdf_path: str) -> PDFKnowledgeBase:
+def extract_pdf_content(pdf_path: str) -> UniversalKnowledgeBase:
     """Extract content from PDF with improved section detection."""
-    kb = PDFKnowledgeBase()
+    kb = UniversalKnowledgeBase()
     
     try:
         logger.info(f"Extracting content from PDF: {pdf_path}")
@@ -119,169 +263,148 @@ def extract_pdf_content(pdf_path: str) -> PDFKnowledgeBase:
             logger.error(f"PDF file not found: {pdf_path}")
             return kb
         
-        # Debug: Log the PDF file size
-        file_size = os.path.getsize(pdf_path)
-        logger.info(f"PDF file size: {file_size} bytes")
-        
-        # Open PDF and extract content
+        # Extract all text from PDF
         with pdfplumber.open(pdf_path) as pdf:
-            logger.info(f"PDF has {len(pdf.pages)} pages")
-            
-            # First pass: collect all text
-            raw_text = ""
+            full_text = ""
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text()
                 if text:
-                    # Add page number marker to help with debugging
-                    raw_text += f"\n\n--- Page {i+1} ---\n\n{text}"
+                    full_text += f"\n\nPage {i+1}:\n\n{text}"
+        
+        # Split text into sections using multiple heuristics
+        sections = []
+        
+        # Split by lines and look for headings
+        lines = full_text.split('\n')
+        current_title = ""
+        current_content = []
+        section_count = 0
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
             
-            # Save raw text for debugging
-            debug_path = os.path.join(DATA_DIR, "pdf_raw_text.txt")
-            with open(debug_path, 'w', encoding='utf-8') as f:
-                f.write(raw_text)
-            logger.info(f"Saved raw PDF text to {debug_path}")
+            # Skip empty lines and page markers
+            if not line or line.startswith('Page '):
+                continue
             
-            # Break text into lines
-            lines = raw_text.split('\n')
+            # Check for potential headings - multiple patterns
+            is_heading = False
             
-            # Identify potential section headings using multiple heuristics
-            sections = []
-            section_starts = []
+            # Pattern 1: Markdown-style heading
+            if line.startswith('#') or line.startswith('==='):
+                is_heading = True
             
-            for i, line in enumerate(lines):
-                line = line.strip()
-                
-                # Skip empty lines and page markers
-                if not line or line.startswith('--- Page'):
-                    continue
-                
-                is_heading = False
-                
-                # Check for heading patterns
-                if line.startswith('#'):
+            # Pattern 2: Short line with special formatting (all caps, etc.)
+            elif len(line) < 60 and (line.isupper() or line[0].isupper()) and i < len(lines) - 1:
+                if not lines[i+1].strip() or not lines[i+1][0].isupper():
                     is_heading = True
-                elif re.match(r'^[A-Z][A-Za-z\s]+$', line) and len(line) < 60:
-                    # Capitalized short line
-                    is_heading = True
-                elif re.match(r'^\d+\.\s+[A-Z]', line):
-                    # Numbered section
-                    is_heading = True
-                elif re.match(r'^[A-Z][a-z]+\s+[vV]ersion', line):
-                    # Special case for "Python version" etc.
-                    is_heading = True
-                    
-                if is_heading:
-                    section_starts.append(i)
             
-            # Create sections based on identified headings
-            for j, start_idx in enumerate(section_starts):
-                # Get the heading line
-                heading = lines[start_idx].strip().lstrip('#').strip()
+            # Pattern 3: Numbered headings
+            elif re.match(r'^\d+\.\s+[A-Z]', line):
+                is_heading = True
+            
+            if is_heading:
+                # Save previous section if it exists
+                if current_title and current_content:
+                    content = '\n'.join(current_content)
+                    sections.append((current_title, content))
+                    section_count += 1
                 
-                # Get content until next heading or end
-                content_lines = []
-                end_idx = section_starts[j+1] if j+1 < len(section_starts) else len(lines)
-                
-                for k in range(start_idx+1, end_idx):
-                    line = lines[k].strip()
-                    if line and not line.startswith('--- Page'):
-                        content_lines.append(line)
-                
-                content = '\n'.join(content_lines)
-                
-                # Add to knowledge base
-                section_id = f"section_{j}"
-                kb.add_section(section_id, heading, content)
-                sections.append((heading, content))
-            
-            logger.info(f"Extracted {len(sections)} sections from PDF")
-            
-            # If no sections were found, create one with all content
-            if not sections:
-                logger.warning("No sections detected, creating one section with all content")
-                kb.add_section("section_0", "PDF Content", raw_text)
-            
-            # Save sections for debugging
-            debug_sections_path = os.path.join(DATA_DIR, "pdf_sections.txt")
-            with open(debug_sections_path, 'w', encoding='utf-8') as f:
-                for heading, content in sections:
-                    f.write(f"==== {heading} ====\n\n{content}\n\n")
-            logger.info(f"Saved extracted sections to {debug_sections_path}")
-            
-            kb.initialized = True
+                # Clean heading
+                current_title = line.strip('# =')
+                current_content = []
+            else:
+                # Add to current content
+                current_content.append(line)
+        
+        # Add the last section
+        if current_title and current_content:
+            content = '\n'.join(current_content)
+            sections.append((current_title, content))
+        
+        # Add sections to knowledge base
+        for i, (title, content) in enumerate(sections):
+            kb.add_section(f"section_{i}", title, content)
+        
+        logger.info(f"Extracted {len(sections)} sections from PDF")
+        
+        # If no sections found, use entire text
+        if not sections:
+            kb.add_section("section_0", "PDF Content", full_text)
+        
+        kb.initialized = True
+        
     except Exception as e:
         logger.error(f"Error extracting PDF content: {str(e)}")
     
     return kb
 
 
-def initialize_knowledge_base(force_refresh=True):  # Set to True to force refresh
+def initialize_knowledge_base(force_refresh=False) -> UniversalKnowledgeBase:
     """Initialize or refresh the knowledge base."""
-    # Always validate PDF exists
-    if not os.path.exists(DEFAULT_PDF_PATH):
-        logger.error(f"PDF file not found: {DEFAULT_PDF_PATH}")
-        logger.error(f"Available files in data directory: {os.listdir(DATA_DIR)}")
-        return None
+    kb = UniversalKnowledgeBase()
     
-    # Try to load existing KB if not forcing refresh
-    kb = PDFKnowledgeBase()
+    # Try to load existing knowledge base
     if not force_refresh and os.path.exists(KNOWLEDGE_BASE_PATH):
         if kb.load(KNOWLEDGE_BASE_PATH):
             return kb
     
+    # Check if PDF exists
+    if not os.path.exists(DEFAULT_PDF_PATH):
+        logger.error(f"PDF file not found: {DEFAULT_PDF_PATH}")
+        return kb
+    
     # Extract content from PDF
-    logger.info("Extracting content from PDF...")
+    logger.info("Creating new knowledge base from PDF")
     kb = extract_pdf_content(DEFAULT_PDF_PATH)
     
     # Save knowledge base
     if kb.initialized:
         kb.save(KNOWLEDGE_BASE_PATH)
-    else:
-        logger.error("Failed to initialize knowledge base from PDF")
     
     return kb
 
 
 async def search_knowledge_base(query: str) -> Tuple[str, Optional[str]]:
-    """Search knowledge base and return the best matching content."""
+    """Search with intelligent content matching."""
     try:
         # Get knowledge base
-        kb = initialize_knowledge_base(force_refresh=False)
+        kb = initialize_knowledge_base()
         
-        if not kb or not kb.initialized:
-            logger.error("Knowledge base not available")
+        if not kb.initialized:
+            logger.error("Knowledge base initialization failed")
             return None, "Knowledge base not available"
         
-        # Search for matching content
+        # Advanced search
         results = kb.search(query)
         
-        # Debug
-        logger.info(f"Search for '{query}' found {len(results)} results")
-        for i, (section_id, content, score) in enumerate(results[:3]):
-            logger.info(f"Result {i+1}: section_id={section_id}, score={score}, content preview: {content[:50]}...")
-        
         if not results:
+            logger.info(f"No results found for query: {query}")
             return None, "No matching information found"
         
         # Get the best match
-        _, content, score = results[0]
+        section_id, score = results[0]
         
-        # Format the response to be just the content part
-        content_parts = content.split('\n\n', 1)
-        if len(content_parts) > 1:
-            # Return content without the heading
-            return content_parts[1].strip(), None
-        else:
-            # Return full content if no clear separation
-            return content.strip(), None
-    
+        logger.info(f"Query: '{query}' matched with section_id: {section_id}, score: {score:.3f}")
+        
+        # Get section content
+        content = kb.get_content(section_id)
+        
+        # If score is too low, don't trust the result
+        if score < 0.15:
+            logger.info(f"Match score too low ({score:.3f}) for query: {query}")
+            return None, "No confident matches found"
+        
+        # Return the content directly
+        return content.strip(), None
+        
     except Exception as e:
         logger.error(f"Error searching knowledge base: {str(e)}")
         return None, f"Error: {str(e)}"
 
 
 class ActionDefaultFallback(OptimusAction, action_name="action_gcp_default_fallback"):
-    """Enhanced fallback with knowledge base search."""
+    """Enhanced fallback with universal knowledge matching."""
 
     async def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: DomainDict) -> List[EventType]:
         query = tracker.latest_message.get('text')
@@ -291,8 +414,8 @@ class ActionDefaultFallback(OptimusAction, action_name="action_gcp_default_fallb
         content, error = await search_knowledge_base(query)
         
         if content:
-            # Found relevant information
-            logger.info(f"Responding with content: {content[:100]}...")
+            # Found relevant information - return just the content
+            logger.info(f"Answering query with content: {content[:100]}...")
             dispatcher.utter_message(text=content)
             return []
         
