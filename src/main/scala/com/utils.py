@@ -1,59 +1,40 @@
 from atlassian import Confluence
+import urllib3
 
-def get_page_by_space_and_title(confluence_url, username, api_token, space_name, page_title):
-    """
-    Get Confluence page content by space name and page title
-    
-    Parameters:
-    - confluence_url: URL of your Confluence instance
-    - username: Confluence username
-    - api_token: Confluence API token
-    - space_name: Name of the Confluence space
-    - page_title: Title of the page to retrieve
-    
-    Returns:
-    - Page content as HTML
-    - None if page not found
-    """
-    # Initialize Confluence connection
-    confluence = Confluence(
-        url=confluence_url,
-        username=username,
-        password=api_token,
-        cloud=True  # Set to False if using Server/Data Center version
+# Disable SSL warnings (since you're using self-signed certificates)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Initialize Confluence connection with hardcoded credentials
+confluence = Confluence(
+    url='https://horizon.tesla.com',  # Your Confluence URL
+    username='your_username',         # Your username
+    password='your_password',         # Your password
+    verify_ssl=False                  # Disable SSL verification
+)
+
+# Get page by space and title (for the GCP Overview page)
+space_name = 'GCPDOC'
+page_title = 'GCP Overview'
+
+try:
+    # Get the page by space and title
+    page = confluence.get_page_by_title(
+        space=space_name,
+        title=page_title
     )
     
-    # Search for the page by title in the specified space
-    pages = confluence.get_all_pages_from_space(space=space_name, start=0, limit=500)
-    
-    # Find the page with the matching title
-    for page in pages:
-        if page['title'] == page_title:
-            # Get the page content using the page_id
-            page_content = confluence.get_page_by_id(page['id'], expand='body.storage')
-            return page_content['body']['storage']['value']
-    
-    return None
-
-# Example usage
-if __name__ == "__main__":
-    # Replace with your actual Confluence details
-    confluence_url = "https://your-domain.atlassian.net"
-    username = "your-email@example.com"
-    api_token = "your-api-token"
-    space_name = "YOURSPACENAME"
-    page_title = "Your Page Title"
-    
-    content = get_page_by_space_and_title(
-        confluence_url, 
-        username, 
-        api_token, 
-        space_name, 
-        page_title
-    )
-    
-    if content:
-        print(f"Page content retrieved successfully!")
-        # Now you can process the content as needed
+    if page:
+        # Get full page content with body
+        page_id = page['id']
+        content = confluence.get_page_by_id(
+            page_id=page_id,
+            expand='body.storage'
+        )
+        
+        # Print the page content (HTML)
+        print(content['body']['storage']['value'])
     else:
-        print(f"Page not found in space '{space_name}' with title '{page_title}'")
+        print(f"Page '{page_title}' not found in space '{space_name}'")
+        
+except Exception as e:
+    print(f"Error accessing Confluence: {e}")
