@@ -27,25 +27,29 @@ class SimpleKnowledgeBase:
     """Simple, robust knowledge base without complex dependencies."""
     
     def __init__(self):
-        self.sections = {}  # {section_heading: section_content}
-        self.keywords = {}  # {keyword: [section_headings]}
+        self.contents = {}  # {section_id: content}
+        self.keywords = {}  # {keyword: [section_ids]}
         self.initialized = False
         
-    def add_section(self, heading: str, content: str):
+    def add_content(self, section_id: str, title: str, content: str):
         """Add a section with its content."""
-        self.sections[heading] = content
+        # Store the full content including title
+        full_content = f"{title}\n\n{content}" if content else title
+        self.contents[section_id] = full_content
         
-        # Extract keywords from heading and content
-        words = re.findall(r'\b\w+\b', heading.lower())
+        # Extract keywords from title and content
+        all_text = f"{title} {content}".lower()
+        words = re.findall(r'\b\w+\b', all_text)
+        
         for word in words:
             if len(word) > 3:  # Only use meaningful words
                 if word not in self.keywords:
                     self.keywords[word] = []
-                if heading not in self.keywords[word]:
-                    self.keywords[word].append(heading)
+                if section_id not in self.keywords[word]:
+                    self.keywords[word].append(section_id)
         
-    def search(self, query: str) -> List[Tuple[str, str, float]]:
-        """Search for matching sections using a simple keyword approach."""
+    def search(self, query: str) -> List[Tuple[str, float]]:
+        """Search for matching content using keywords."""
         if not self.initialized:
             return []
         
@@ -57,21 +61,21 @@ class SimpleKnowledgeBase:
         section_scores = {}
         for word in query_words:
             if word in self.keywords:
-                for heading in self.keywords[word]:
-                    if heading not in section_scores:
-                        section_scores[heading] = 0
-                    section_scores[heading] += 1
+                for section_id in self.keywords[word]:
+                    if section_id not in section_scores:
+                        section_scores[section_id] = 0
+                    section_scores[section_id] += 1
         
         # Create results with scores
         results = []
-        for heading, score in section_scores.items():
+        for section_id, score in section_scores.items():
             # Calculate a normalized score
             normalized_score = score / max(len(query_words), 1)
             if normalized_score > 0.2:  # Only include reasonable matches
-                results.append((heading, self.sections[heading], normalized_score))
+                results.append((self.contents[section_id], normalized_score))
         
         # Sort by score descending
-        results.sort(key=lambda x: x[2], reverse=True)
+        results.sort(key=lambda x: x[1], reverse=True)
         
         return results
     
@@ -80,10 +84,11 @@ class SimpleKnowledgeBase:
         try:
             with open(file_path, 'w') as f:
                 json.dump({
-                    'sections': self.sections,
+                    'contents': self.contents,
                     'keywords': self.keywords
                 }, f, indent=2)
             logger.info(f"Saved knowledge base to {file_path}")
+            self.initialized = True
             return True
         except Exception as e:
             logger.error(f"Error saving knowledge base: {e}")
@@ -98,11 +103,11 @@ class SimpleKnowledgeBase:
             
             with open(file_path, 'r') as f:
                 data = json.load(f)
-                self.sections = data.get('sections', {})
+                self.contents = data.get('contents', {})
                 self.keywords = data.get('keywords', {})
                 
-            self.initialized = len(self.sections) > 0
-            logger.info(f"Loaded knowledge base with {len(self.sections)} sections")
+            self.initialized = len(self.contents) > 0
+            logger.info(f"Loaded knowledge base with {len(self.contents)} content sections")
             return True
         except Exception as e:
             logger.error(f"Error loading knowledge base: {e}")
@@ -128,63 +133,57 @@ def extract_knowledge_from_pdf(pdf_path: str) -> SimpleKnowledgeBase:
                 if page_text:
                     full_text += page_text + "\n\n"
             
-            # Split text into sections based on headings
+            # Extract content sections with their headings
             sections = []
             
-            # First try to find markdown-style headings
-            heading_pattern = r'(?:^|\n)#+\s+(.*?)(?:\n|$)'
-            headings = re.findall(heading_pattern, full_text)
+            # Split text into lines for analysis
+            lines = full_text.split('\n')
             
-            if headings:
-                # Split by markdown headings
-                chunks = re.split(heading_pattern, full_text)[1:]  # Skip first which is before any heading
+            # Process lines to find sections
+            i = 0
+            current_title = None
+            current_content_lines = []
+            section_count = 0
+            
+            while i < len(lines):
+                line = lines[i].strip()
                 
-                for i, heading in enumerate(headings):
-                    if i < len(chunks):
-                        sections.append((heading.strip(), chunks[i].strip()))
-            else:
-                # Try to find headings based on line length and characteristics
-                lines = full_text.split('\n')
-                i = 0
-                current_heading = None
-                current_content = []
-                
-                while i < len(lines):
-                    line = lines[i].strip()
-                    
-                    is_heading = False
-                    if line and len(line) < 80:
-                        # Short line that's not part of a paragraph
+                # Check if this line looks like a heading
+                is_heading = False
+                if line and len(line) < 80:
+                    # Look for title patterns like "# Something" or short lines
+                    if line.startswith('#') or (len(line) < 50 and not line.endswith('.')) or line.isupper():
+                        # Check if next line is blank or next line is not a continuation
                         next_line = lines[i+1].strip() if i+1 < len(lines) else ""
-                        
-                        # Check if followed by blank or if it looks like a title
-                        if not next_line or (line.istitle() and not line.endswith('.')):
+                        if not next_line or next_line.startswith('#'):
                             is_heading = True
-                    
-                    if is_heading:
-                        # Save previous section
-                        if current_heading and current_content:
-                            sections.append((current_heading, '\n'.join(current_content)))
-                        
-                        # Start new section
-                        current_heading = line
-                        current_content = []
-                    elif line:
-                        # Add to current content
-                        current_content.append(line)
-                    
-                    i += 1
                 
-                # Add final section
-                if current_heading and current_content:
-                    sections.append((current_heading, '\n'.join(current_content)))
+                if is_heading:
+                    # Save previous section if it exists
+                    if current_title:
+                        section_id = f"section_{section_count}"
+                        section_count += 1
+                        content = "\n".join(current_content_lines)
+                        kb.add_content(section_id, current_title, content)
+                    
+                    # Start new section
+                    current_title = line.lstrip('#').strip()
+                    current_content_lines = []
+                elif line:
+                    # Add to current content
+                    current_content_lines.append(line)
+                
+                i += 1
             
-            # Add sections to knowledge base
-            for heading, content in sections:
-                kb.add_section(heading, content)
+            # Add the last section
+            if current_title:
+                section_id = f"section_{section_count}"
+                content = "\n".join(current_content_lines)
+                kb.add_content(section_id, current_title, content)
             
+            # Mark as initialized if we have content
             kb.initialized = True
-            logger.info(f"Extracted {len(sections)} sections from PDF")
+            logger.info(f"Extracted {section_count+1} sections from PDF")
     
     except Exception as e:
         logger.error(f"Error extracting knowledge from PDF: {e}")
@@ -205,13 +204,6 @@ def initialize_knowledge_base(force_refresh=False) -> SimpleKnowledgeBase:
     # Need to create or refresh knowledge base
     logger.info("Creating new knowledge base from PDF")
     
-    # Verify PDF exists
-    if not os.path.exists(DEFAULT_PDF_PATH):
-        logger.error(f"PDF file not found: {DEFAULT_PDF_PATH}")
-        logger.error(f"Current directory: {os.getcwd()}")
-        logger.error(f"Data directory: {DATA_DIR}")
-        return kb
-    
     # Extract knowledge from PDF
     kb = extract_knowledge_from_pdf(DEFAULT_PDF_PATH)
     
@@ -223,7 +215,7 @@ def initialize_knowledge_base(force_refresh=False) -> SimpleKnowledgeBase:
 
 
 async def search_knowledge_base(query: str) -> Tuple[str, Optional[str]]:
-    """Search the knowledge base using a simple keyword approach."""
+    """Search knowledge base and return actual answer content."""
     try:
         # Get knowledge base
         kb = initialize_knowledge_base()
@@ -238,12 +230,31 @@ async def search_knowledge_base(query: str) -> Tuple[str, Optional[str]]:
         if not results:
             return None, "No matching information found"
         
-        # Get best match
-        heading, content, score = results[0]
+        # Get best match - IMPORTANT: This contains the full text, not just the heading
+        content, score = results[0]
         
-        # Format response - just return the content
-        logger.info(f"Found match for '{query}': {heading} (score: {score})")
-        return content.strip(), None
+        # Remove title/heading part if present
+        content_parts = content.split('\n\n', 1)
+        if len(content_parts) > 1:
+            # Full content after the heading
+            answer = content_parts[1].strip()
+        else:
+            # Just use the whole content if we can't separate
+            answer = content.strip()
+        
+        # If the answer is very short, it might be just a heading
+        # In that case, include the second best result if available
+        if len(answer) < 20 and len(results) > 1:
+            logger.info("First result was too short, adding second result")
+            second_content, _ = results[1]
+            second_parts = second_content.split('\n\n', 1)
+            if len(second_parts) > 1:
+                answer += "\n\n" + second_parts[1].strip()
+        
+        logger.info(f"Found match for '{query}' (score: {score})")
+        logger.info(f"Returning answer: {answer[:100]}...")
+        
+        return answer, None
     
     except Exception as e:
         logger.error(f"Error searching knowledge base: {e}")
@@ -261,7 +272,8 @@ class ActionDefaultFallback(OptimusAction, action_name="action_gcp_default_fallb
         content, error = await search_knowledge_base(query)
         
         if content:
-            # Found relevant information - respond with content
+            # Found relevant information - respond with full content
+            logger.info(f"Answering with content: {content[:100]}...")
             dispatcher.utter_message(text=content)
             return []
         
