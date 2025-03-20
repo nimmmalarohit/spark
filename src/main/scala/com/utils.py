@@ -17,252 +17,271 @@ logger = logging.getLogger(__name__)
 
 # Define paths - use absolute paths to avoid any confusion
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-DEFAULT_PDF_PATH = os.path.join(DATA_DIR, "gcp_security_guidelines.pdf")
+DEFAULT_PDF_PATH = os.path.join(DATA_DIR, "gcp_t2_l3.pdf")  # Updated to match your actual PDF name
 KNOWLEDGE_BASE_PATH = os.path.join(DATA_DIR, "wiki_knowledge.json")
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
 
-class SimpleKnowledgeBase:
-    """Simple, robust knowledge base without complex dependencies."""
+class PDFKnowledgeBase:
+    """Robust knowledge base for PDF content."""
     
     def __init__(self):
-        self.contents = {}  # {section_id: content}
-        self.keywords = {}  # {keyword: [section_ids]}
+        self.sections = {}  # {id: {title, content}}
         self.initialized = False
         
-    def add_content(self, section_id: str, title: str, content: str):
-        """Add a section with its content."""
-        # Store the full content including title
-        full_content = f"{title}\n\n{content}" if content else title
-        self.contents[section_id] = full_content
+    def add_section(self, section_id: str, title: str, content: str):
+        """Add a section to the knowledge base."""
+        self.sections[section_id] = {
+            "title": title,
+            "content": content
+        }
         
-        # Extract keywords from title and content
-        all_text = f"{title} {content}".lower()
-        words = re.findall(r'\b\w+\b', all_text)
-        
-        for word in words:
-            if len(word) > 3:  # Only use meaningful words
-                if word not in self.keywords:
-                    self.keywords[word] = []
-                if section_id not in self.keywords[word]:
-                    self.keywords[word].append(section_id)
-        
-    def search(self, query: str) -> List[Tuple[str, float]]:
-        """Search for matching content using keywords."""
-        if not self.initialized:
+    def search(self, query: str) -> List[Tuple[str, str, float]]:
+        """Search for content matching the query."""
+        if not self.initialized or not self.sections:
+            logger.warning("Knowledge base not initialized or empty")
             return []
         
-        # Extract keywords from query
-        query_words = re.findall(r'\b\w+\b', query.lower())
-        query_words = [w for w in query_words if len(w) > 3]  # Only meaningful words
+        # Clean query
+        query = query.lower().strip()
         
-        # Count keyword matches for each section
-        section_scores = {}
-        for word in query_words:
-            if word in self.keywords:
-                for section_id in self.keywords[word]:
-                    if section_id not in section_scores:
-                        section_scores[section_id] = 0
-                    section_scores[section_id] += 1
+        # Extract keywords (anything 3+ chars)
+        keywords = [w.lower() for w in re.findall(r'\b\w{3,}\b', query)]
         
-        # Create results with scores
+        # Calculate match scores for each section
         results = []
-        for section_id, score in section_scores.items():
-            # Calculate a normalized score
-            normalized_score = score / max(len(query_words), 1)
-            if normalized_score > 0.2:  # Only include reasonable matches
-                results.append((self.contents[section_id], normalized_score))
+        for section_id, section in self.sections.items():
+            title = section["title"].lower()
+            content = section["content"].lower()
+            
+            # Calculate score based on keyword matches
+            score = 0
+            for keyword in keywords:
+                # Higher score for title matches
+                if keyword in title:
+                    score += 3
+                # Score for content matches
+                if keyword in content:
+                    score += 1
+            
+            # Normalize by number of keywords
+            if keywords:
+                score = score / len(keywords)
+                
+                # Only include if score is reasonable
+                if score > 0.5:
+                    full_content = f"{section['title']}\n\n{section['content']}"
+                    results.append((section_id, full_content, score))
         
-        # Sort by score descending
-        results.sort(key=lambda x: x[1], reverse=True)
-        
+        # Sort by score
+        results.sort(key=lambda x: x[2], reverse=True)
         return results
     
     def save(self, file_path: str) -> bool:
-        """Save knowledge base to disk."""
+        """Save knowledge base to file."""
         try:
             with open(file_path, 'w') as f:
-                json.dump({
-                    'contents': self.contents,
-                    'keywords': self.keywords
-                }, f, indent=2)
-            logger.info(f"Saved knowledge base to {file_path}")
+                json.dump(self.sections, f, indent=2)
             self.initialized = True
+            logger.info(f"Saved knowledge base with {len(self.sections)} sections")
             return True
         except Exception as e:
             logger.error(f"Error saving knowledge base: {e}")
             return False
     
     def load(self, file_path: str) -> bool:
-        """Load knowledge base from disk."""
+        """Load knowledge base from file."""
         try:
             if not os.path.exists(file_path):
                 logger.warning(f"Knowledge base file not found: {file_path}")
                 return False
             
             with open(file_path, 'r') as f:
-                data = json.load(f)
-                self.contents = data.get('contents', {})
-                self.keywords = data.get('keywords', {})
-                
-            self.initialized = len(self.contents) > 0
-            logger.info(f"Loaded knowledge base with {len(self.contents)} content sections")
-            return True
+                self.sections = json.load(f)
+            
+            self.initialized = len(self.sections) > 0
+            logger.info(f"Loaded knowledge base with {len(self.sections)} sections")
+            return self.initialized
         except Exception as e:
             logger.error(f"Error loading knowledge base: {e}")
             return False
 
 
-def extract_knowledge_from_pdf(pdf_path: str) -> SimpleKnowledgeBase:
-    """Extract knowledge from PDF using a simple, robust approach."""
-    kb = SimpleKnowledgeBase()
+def extract_pdf_content(pdf_path: str) -> PDFKnowledgeBase:
+    """Extract content from PDF with improved section detection."""
+    kb = PDFKnowledgeBase()
     
     try:
-        logger.info(f"Extracting knowledge from {pdf_path}")
+        logger.info(f"Extracting content from PDF: {pdf_path}")
         
         if not os.path.exists(pdf_path):
             logger.error(f"PDF file not found: {pdf_path}")
             return kb
         
+        # Debug: Log the PDF file size
+        file_size = os.path.getsize(pdf_path)
+        logger.info(f"PDF file size: {file_size} bytes")
+        
+        # Open PDF and extract content
         with pdfplumber.open(pdf_path) as pdf:
-            # Extract text from all pages
-            full_text = ""
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    full_text += page_text + "\n\n"
+            logger.info(f"PDF has {len(pdf.pages)} pages")
             
-            # Extract content sections with their headings
+            # First pass: collect all text
+            raw_text = ""
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text()
+                if text:
+                    # Add page number marker to help with debugging
+                    raw_text += f"\n\n--- Page {i+1} ---\n\n{text}"
+            
+            # Save raw text for debugging
+            debug_path = os.path.join(DATA_DIR, "pdf_raw_text.txt")
+            with open(debug_path, 'w', encoding='utf-8') as f:
+                f.write(raw_text)
+            logger.info(f"Saved raw PDF text to {debug_path}")
+            
+            # Break text into lines
+            lines = raw_text.split('\n')
+            
+            # Identify potential section headings using multiple heuristics
             sections = []
+            section_starts = []
             
-            # Split text into lines for analysis
-            lines = full_text.split('\n')
-            
-            # Process lines to find sections
-            i = 0
-            current_title = None
-            current_content_lines = []
-            section_count = 0
-            
-            while i < len(lines):
-                line = lines[i].strip()
+            for i, line in enumerate(lines):
+                line = line.strip()
                 
-                # Check if this line looks like a heading
+                # Skip empty lines and page markers
+                if not line or line.startswith('--- Page'):
+                    continue
+                
                 is_heading = False
-                if line and len(line) < 80:
-                    # Look for title patterns like "# Something" or short lines
-                    if line.startswith('#') or (len(line) < 50 and not line.endswith('.')) or line.isupper():
-                        # Check if next line is blank or next line is not a continuation
-                        next_line = lines[i+1].strip() if i+1 < len(lines) else ""
-                        if not next_line or next_line.startswith('#'):
-                            is_heading = True
                 
-                if is_heading:
-                    # Save previous section if it exists
-                    if current_title:
-                        section_id = f"section_{section_count}"
-                        section_count += 1
-                        content = "\n".join(current_content_lines)
-                        kb.add_content(section_id, current_title, content)
+                # Check for heading patterns
+                if line.startswith('#'):
+                    is_heading = True
+                elif re.match(r'^[A-Z][A-Za-z\s]+$', line) and len(line) < 60:
+                    # Capitalized short line
+                    is_heading = True
+                elif re.match(r'^\d+\.\s+[A-Z]', line):
+                    # Numbered section
+                    is_heading = True
+                elif re.match(r'^[A-Z][a-z]+\s+[vV]ersion', line):
+                    # Special case for "Python version" etc.
+                    is_heading = True
                     
-                    # Start new section
-                    current_title = line.lstrip('#').strip()
-                    current_content_lines = []
-                elif line:
-                    # Add to current content
-                    current_content_lines.append(line)
+                if is_heading:
+                    section_starts.append(i)
+            
+            # Create sections based on identified headings
+            for j, start_idx in enumerate(section_starts):
+                # Get the heading line
+                heading = lines[start_idx].strip().lstrip('#').strip()
                 
-                i += 1
+                # Get content until next heading or end
+                content_lines = []
+                end_idx = section_starts[j+1] if j+1 < len(section_starts) else len(lines)
+                
+                for k in range(start_idx+1, end_idx):
+                    line = lines[k].strip()
+                    if line and not line.startswith('--- Page'):
+                        content_lines.append(line)
+                
+                content = '\n'.join(content_lines)
+                
+                # Add to knowledge base
+                section_id = f"section_{j}"
+                kb.add_section(section_id, heading, content)
+                sections.append((heading, content))
             
-            # Add the last section
-            if current_title:
-                section_id = f"section_{section_count}"
-                content = "\n".join(current_content_lines)
-                kb.add_content(section_id, current_title, content)
+            logger.info(f"Extracted {len(sections)} sections from PDF")
             
-            # Mark as initialized if we have content
+            # If no sections were found, create one with all content
+            if not sections:
+                logger.warning("No sections detected, creating one section with all content")
+                kb.add_section("section_0", "PDF Content", raw_text)
+            
+            # Save sections for debugging
+            debug_sections_path = os.path.join(DATA_DIR, "pdf_sections.txt")
+            with open(debug_sections_path, 'w', encoding='utf-8') as f:
+                for heading, content in sections:
+                    f.write(f"==== {heading} ====\n\n{content}\n\n")
+            logger.info(f"Saved extracted sections to {debug_sections_path}")
+            
             kb.initialized = True
-            logger.info(f"Extracted {section_count+1} sections from PDF")
-    
     except Exception as e:
-        logger.error(f"Error extracting knowledge from PDF: {e}")
+        logger.error(f"Error extracting PDF content: {str(e)}")
     
     return kb
 
 
-def initialize_knowledge_base(force_refresh=False) -> SimpleKnowledgeBase:
+def initialize_knowledge_base(force_refresh=True):  # Set to True to force refresh
     """Initialize or refresh the knowledge base."""
-    kb = SimpleKnowledgeBase()
+    # Always validate PDF exists
+    if not os.path.exists(DEFAULT_PDF_PATH):
+        logger.error(f"PDF file not found: {DEFAULT_PDF_PATH}")
+        logger.error(f"Available files in data directory: {os.listdir(DATA_DIR)}")
+        return None
     
-    # Try to load existing knowledge base
+    # Try to load existing KB if not forcing refresh
+    kb = PDFKnowledgeBase()
     if not force_refresh and os.path.exists(KNOWLEDGE_BASE_PATH):
         if kb.load(KNOWLEDGE_BASE_PATH):
-            logger.info("Successfully loaded existing knowledge base")
             return kb
     
-    # Need to create or refresh knowledge base
-    logger.info("Creating new knowledge base from PDF")
+    # Extract content from PDF
+    logger.info("Extracting content from PDF...")
+    kb = extract_pdf_content(DEFAULT_PDF_PATH)
     
-    # Extract knowledge from PDF
-    kb = extract_knowledge_from_pdf(DEFAULT_PDF_PATH)
-    
-    # Save knowledge base if successful
+    # Save knowledge base
     if kb.initialized:
         kb.save(KNOWLEDGE_BASE_PATH)
+    else:
+        logger.error("Failed to initialize knowledge base from PDF")
     
     return kb
 
 
 async def search_knowledge_base(query: str) -> Tuple[str, Optional[str]]:
-    """Search knowledge base and return actual answer content."""
+    """Search knowledge base and return the best matching content."""
     try:
         # Get knowledge base
-        kb = initialize_knowledge_base()
+        kb = initialize_knowledge_base(force_refresh=False)
         
-        if not kb.initialized:
-            logger.error("Knowledge base initialization failed")
-            return None, "Knowledge base could not be initialized"
+        if not kb or not kb.initialized:
+            logger.error("Knowledge base not available")
+            return None, "Knowledge base not available"
         
-        # Search for matching sections
+        # Search for matching content
         results = kb.search(query)
+        
+        # Debug
+        logger.info(f"Search for '{query}' found {len(results)} results")
+        for i, (section_id, content, score) in enumerate(results[:3]):
+            logger.info(f"Result {i+1}: section_id={section_id}, score={score}, content preview: {content[:50]}...")
         
         if not results:
             return None, "No matching information found"
         
-        # Get best match - IMPORTANT: This contains the full text, not just the heading
-        content, score = results[0]
+        # Get the best match
+        _, content, score = results[0]
         
-        # Remove title/heading part if present
+        # Format the response to be just the content part
         content_parts = content.split('\n\n', 1)
         if len(content_parts) > 1:
-            # Full content after the heading
-            answer = content_parts[1].strip()
+            # Return content without the heading
+            return content_parts[1].strip(), None
         else:
-            # Just use the whole content if we can't separate
-            answer = content.strip()
-        
-        # If the answer is very short, it might be just a heading
-        # In that case, include the second best result if available
-        if len(answer) < 20 and len(results) > 1:
-            logger.info("First result was too short, adding second result")
-            second_content, _ = results[1]
-            second_parts = second_content.split('\n\n', 1)
-            if len(second_parts) > 1:
-                answer += "\n\n" + second_parts[1].strip()
-        
-        logger.info(f"Found match for '{query}' (score: {score})")
-        logger.info(f"Returning answer: {answer[:100]}...")
-        
-        return answer, None
+            # Return full content if no clear separation
+            return content.strip(), None
     
     except Exception as e:
-        logger.error(f"Error searching knowledge base: {e}")
+        logger.error(f"Error searching knowledge base: {str(e)}")
         return None, f"Error: {str(e)}"
 
 
 class ActionDefaultFallback(OptimusAction, action_name="action_gcp_default_fallback"):
-    """Simple, robust fallback action with knowledge base search."""
+    """Enhanced fallback with knowledge base search."""
 
     async def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: DomainDict) -> List[EventType]:
         query = tracker.latest_message.get('text')
@@ -272,10 +291,14 @@ class ActionDefaultFallback(OptimusAction, action_name="action_gcp_default_fallb
         content, error = await search_knowledge_base(query)
         
         if content:
-            # Found relevant information - respond with full content
-            logger.info(f"Answering with content: {content[:100]}...")
+            # Found relevant information
+            logger.info(f"Responding with content: {content[:100]}...")
             dispatcher.utter_message(text=content)
             return []
+        
+        # Log the error if any
+        if error:
+            logger.warning(f"Knowledge base search error: {error}")
         
         # Default fallback response
         draft_email_button = PostBackButton.with_intent(title="Draft email", intent="gcp_feedback")
