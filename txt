@@ -1,0 +1,45 @@
+WITH status_changes AS (
+    SELECT 
+        wrs.workflow_run_id,
+        wrs.status as current_status,
+        LAG(wrs.status) OVER (PARTITION BY wrs.workflow_run_id ORDER BY wrs.created_on) as prev_status,
+        wrs.created_on as status_time,
+        LAG(wrs.created_on) OVER (PARTITION BY wrs.workflow_run_id ORDER BY wrs.created_on) as prev_status_time,
+        wrs.error_details,
+        wr.run_on,
+        wr.workflow_id,
+        r.workflow_config
+    FROM 
+        workflow_run_status wrs
+        JOIN workflow_run wr ON wrs.workflow_run_id = wr.id
+        JOIN workflow_registry r ON r.id = wr.workflow_id
+    WHERE 
+        wrs.created_on >= SYSTIMESTAMP - INTERVAL '60' DAY
+        AND r.workflow_config LIKE '%"platform":"SPARK"%'
+)
+SELECT 
+    workflow_run_id,
+    prev_status,
+    current_status,
+    error_details,
+    status_time as failed_time,
+    run_on as start_time,
+    EXTRACT(HOUR FROM (status_time - run_on)) as hours_to_failure,
+    -- Flag for reruns
+    COUNT(*) OVER (PARTITION BY workflow_id) as run_count
+FROM 
+    status_changes
+WHERE 
+    -- Status transition from RUNNING to FAILED
+    prev_status = 'RUNNING' 
+    AND current_status = 'FAILED'
+    -- Failed after 6+ hours
+    AND EXTRACT(HOUR FROM (status_time - run_on)) >= 6
+    -- Specific error patterns
+    AND (
+        UPPER(error_details) LIKE '%INTERRUPTED FOR UI%' 
+        OR UPPER(error_details) LIKE '%REF NODES%'
+        OR error_details IS NOT NULL  -- Remove this line if you only want specific errors
+    )
+ORDER BY 
+    failed_time DESC;
